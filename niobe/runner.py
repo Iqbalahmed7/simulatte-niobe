@@ -148,6 +148,8 @@ def _build_study_config(
         "massachusetts", "virginia", "us_northeast", "us_south", "us_midwest", "us_west",
         "united_kingdom", "france", "germany", "spain", "italy",
         "netherlands", "poland", "sweden",
+        "united_arab_emirates", "uae", "dubai", "abu_dhabi",
+        "saudi_arabia", "ksa",
     }
 
     # PopulationSpec
