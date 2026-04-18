@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "simulatte-niobe"
+version = "0.1.0"
+description = "Niobe population study orchestrator for Simulatte"
+requires-python = ">=3.11"
+# Runtime dependency on popscale is satisfied by the engine's requirements.txt
+# (popscale is installed before niobe so it's available at import time)
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["niobe*"]
