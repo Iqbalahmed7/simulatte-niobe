@@ -42,13 +42,36 @@ Usage::
 from __future__ import annotations
 
 import asyncio
+import functools
+import json
 import logging
 import os
+import signal
 import sys
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
+_MAX_CONCURRENT_LLM = int(os.getenv("SIMULATTE_MAX_CONCURRENT_LLM", "20"))
+_llm_semaphore: asyncio.Semaphore | None = None
+
+
+def _get_llm_semaphore() -> asyncio.Semaphore:
+    global _llm_semaphore
+    if _llm_semaphore is None:
+        _llm_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_LLM)
+    return _llm_semaphore
+
+
+def with_llm_semaphore(func):
+    """Wrap an async LLM-calling function with the shared semaphore."""
+    @functools.wraps(func)
+    async def wrapper(*args, **kwargs):
+        async with _get_llm_semaphore():
+            return await func(*args, **kwargs)
+    return wrapper
 
 # ── Path setup ────────────────────────────────────────────────────────────────
 _POPSCALE_ROOT = Path(__file__).parents[2] / "PopScale"
@@ -71,6 +94,7 @@ from popscale.study.study_runner import StudyConfig, StudyResult, run_study  # n
 
 # ── Niobe imports ─────────────────────────────────────────────────────────────
 from .study_request import NiobeStudyRequest                          # noqa: E402
+from src.observability.cost_tracer import CostTracer                 # noqa: E402
 
 
 # ── Domain mapping ────────────────────────────────────────────────────────────
@@ -106,6 +130,7 @@ async def run_niobe_study(
     request: NiobeStudyRequest,
     *,
     llm_client: Any = None,
+    enable_partial_writes: bool = True,
 ) -> StudyResult:
     """Translate a NiobeStudyRequest into a PopScale study and run it.
 
@@ -119,7 +144,50 @@ async def run_niobe_study(
     logger.info("run_niobe_study | %s", request.summary())
 
     config = _build_study_config(request, llm_client=llm_client)
-    return await run_study(config)
+    guarded_run_study = with_llm_semaphore(run_study)
+
+    if not enable_partial_writes:
+        result = await guarded_run_study(config)
+        for persona in result.cohort.personas:
+            summary = CostTracer.finish_persona(persona.persona_id)
+            logger.info("persona_cost_summary: %s", summary)
+        return result
+
+    config.run_id = config.run_id or request.run_id or f"niobe-{uuid.uuid4().hex[:8]}"
+    output_dir = _resolve_output_dir(request)
+    partial_path = output_dir / f"{config.run_id}.partial.json"
+    _write_partial_json(partial_path, None, status="in_progress")
+    result: StudyResult | None = None
+
+    previous_handlers: dict[int, Any] = {}
+
+    def _flush_partial() -> None:
+        _write_partial_json(partial_path, result, status="in_progress")
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            previous_handlers[sig] = signal.getsignal(sig)
+            signal.signal(sig, lambda *_: _flush_partial())
+        except (ValueError, RuntimeError):
+            continue
+
+    try:
+        result = await guarded_run_study(config)
+        _write_partial_json(partial_path, result, status="completed")
+    except Exception:
+        _write_partial_json(partial_path, result, status="failed")
+        raise
+    finally:
+        for sig, handler in previous_handlers.items():
+            try:
+                signal.signal(sig, handler)
+            except (ValueError, RuntimeError):
+                continue
+
+    for persona in result.cohort.personas:
+        summary = CostTracer.finish_persona(persona.persona_id)
+        logger.info("persona_cost_summary: %s", summary)
+    return result
 
 
 def run_niobe_study_sync(
@@ -128,6 +196,56 @@ def run_niobe_study_sync(
 ) -> StudyResult:
     """Synchronous wrapper. Do not call from an active event loop."""
     return asyncio.run(run_niobe_study(request, **kwargs))
+
+
+async def run_niobe_study_streaming(
+    request: NiobeStudyRequest,
+    *,
+    llm_client: Any = None,
+) -> StudyResult:
+    """Compatibility streaming entrypoint with partial checkpoint writes enabled."""
+    return await run_niobe_study(
+        request,
+        llm_client=llm_client,
+        enable_partial_writes=True,
+    )
+
+
+def _resolve_output_dir(request: NiobeStudyRequest) -> Path:
+    output_dir = Path(request.output_dir) if request.output_dir else Path(
+        os.getenv("SIMULATTE_PARTIAL_DIR", "/tmp/wb_reruns")
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir
+
+
+def _json_default(value: Any) -> Any:
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json")
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)
+
+
+def _write_partial_json(path: Path, result: StudyResult | None, *, status: str) -> None:
+    payload: dict[str, Any] = {
+        "status": status,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if result is not None:
+        payload.update({
+            "run_id": result.run_id,
+            "n_personas": result.n_personas,
+            "cohort_size": result.cohort.total_delivered,
+            "seat_report_available": result.report is not None,
+            "cost_usd": round(result.total_cost_usd, 4),
+            "cohort": result.cohort,
+            "simulation": result.simulation,
+        })
+    path.write_text(
+        json.dumps(payload, default=_json_default, indent=2),
+        encoding="utf-8",
+    )
 
 
 # ── Translation helpers ───────────────────────────────────────────────────────
