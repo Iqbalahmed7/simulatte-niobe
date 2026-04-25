@@ -94,7 +94,10 @@ from popscale.study.study_runner import StudyConfig, StudyResult, run_study  # n
 
 # ── Niobe imports ─────────────────────────────────────────────────────────────
 from .study_request import NiobeStudyRequest                          # noqa: E402
-from src.observability.cost_tracer import CostTracer                 # noqa: E402
+try:
+    from src.observability.cost_tracer import CostTracer             # noqa: E402
+except ImportError:
+    CostTracer = None  # type: ignore[assignment,misc]
 
 
 # ── Domain mapping ────────────────────────────────────────────────────────────
@@ -149,8 +152,9 @@ async def run_niobe_study(
     if not enable_partial_writes:
         result = await guarded_run_study(config)
         for persona in result.cohort.personas:
-            summary = CostTracer.finish_persona(persona.persona_id)
-            logger.info("persona_cost_summary: %s", summary)
+            if CostTracer is not None:
+                summary = CostTracer.finish_persona(persona.persona_id)
+                logger.info("persona_cost_summary: %s", summary)
         return result
 
     config.run_id = config.run_id or request.run_id or f"niobe-{uuid.uuid4().hex[:8]}"
@@ -185,8 +189,9 @@ async def run_niobe_study(
                 continue
 
     for persona in result.cohort.personas:
-        summary = CostTracer.finish_persona(persona.persona_id)
-        logger.info("persona_cost_summary: %s", summary)
+        if CostTracer is not None:
+            summary = CostTracer.finish_persona(persona.persona_id)
+            logger.info("persona_cost_summary: %s", summary)
     return result
 
 
