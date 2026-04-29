@@ -60,6 +60,19 @@ _llm_semaphore: asyncio.Semaphore | None = None
 
 def _get_llm_semaphore() -> asyncio.Semaphore:
     global _llm_semaphore
+    if _llm_semaphore is not None:
+        # Python 3.12: asyncio primitives bind to their loop on first await.
+        # Engine calls run_niobe_study_sync() which calls asyncio.run() per
+        # request — each invocation creates a new event loop. Detect loop
+        # rotation and discard the stale semaphore so we never hit
+        # "Future attached to a different loop".
+        bound_loop = getattr(_llm_semaphore, "_loop", None)
+        if bound_loop is not None:
+            try:
+                if asyncio.get_running_loop() is not bound_loop:
+                    _llm_semaphore = None
+            except RuntimeError:
+                _llm_semaphore = None
     if _llm_semaphore is None:
         _llm_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_LLM)
     return _llm_semaphore
